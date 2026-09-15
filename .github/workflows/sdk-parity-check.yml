@@ -1,0 +1,283 @@
+# Gates every pull request in a ThunderID SDK repository on an explicit cross-SDK parity decision,
+# so a capability that ships in one SDK is never silently forgotten in the others.
+#
+# Specification: https://github.com/thunder-id/thunderid/blob/main/docs-internals/sdk-development/spec.md
+# Tracking issue: https://github.com/thunder-id/thunderid/issues/5305
+#
+# Every pull request must carry exactly one of:
+#
+#   parity/prs-raised      the ports exist in the other SDKs, or are recorded as not applying there
+#   parity/prs-not-needed  nothing here reaches another SDK
+#
+# Until one is present the check fails. A label is the only thing that clears it: there is no path
+# based exemption, because "this looked like a docs change" is exactly how a gap gets through.
+# Applying or removing a label re-runs the check, so it clears without a push.
+#
+# Alongside the gate, the check posts one comment carrying a checklist of the sibling repositories
+# and ticks the boxes itself as port links appear in the pull request body or in replies on the
+# thread. Contributors cannot edit that comment, external ones especially, so nobody is asked to
+# maintain it by hand.
+#
+# This workflow is called by a thin caller in each SDK repository, which owns the triggers. It
+# reads the calling repository from the event, so the caller passes nothing and the sibling list
+# cannot drift between repositories.
+#
+# `pull_request_target` in the caller, rather than `pull_request`, is deliberate: the check has to
+# label and comment on pull requests opened from forks, where the `pull_request` token is read
+# only. Nothing from the contributor's branch is checked out or executed here, so the elevated
+# token is never handed to untrusted code. Keep it that way.
+#
+# Uses:
+#   OS: ubuntu-latest
+
+name: SDK Parity Check
+
+on:
+  workflow_call:
+    inputs:
+      siblings:
+        description: >
+          Optional override for the repositories a change here may need to be ported to, one per
+          line as "owner/repo: description". Defaults to the other ThunderID SDK repositories.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  parity:
+    name: 🏷️ Parity Decision
+    # Comments on plain issues are out of scope; only pull request threads carry a parity decision.
+    if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: ⏭️ Skip for the merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "The parity decision was already enforced on the pull request; nothing to do here."
+
+      - name: 🏷️ Check the parity label and refresh the port checklist
+        if: github.event_name != 'merge_group'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          SIBLINGS_OVERRIDE: ${{ inputs.siblings }}
+        with:
+          script: |
+            // Identifies this check's own comment so it is updated in place rather than posted
+            // again on every push, label change, or reply.
+            const MARKER = '<!-- thunderid-parity-check -->';
+
+            const RAISED_LABEL = 'parity/prs-raised';
+            const NOT_NEEDED_LABEL = 'parity/prs-not-needed';
+            const SPEC = 'https://github.com/thunder-id/thunderid/blob/main/docs-internals/sdk-development/spec.md';
+
+            // Every ThunderID SDK repository. The one the check is running in drops out below, so
+            // this list is identical in all four and there is no per repository input to keep in
+            // step.
+            const SDK_REPOSITORIES = [
+              ['thunder-id/javascript-sdks', 'JavaScript (React, Vue, Nuxt, Next.js, Express, React Router, TanStack Router, Browser, Node)'],
+              ['thunder-id/ios-sdks', 'iOS'],
+              ['thunder-id/android-sdks', 'Android'],
+              ['thunder-id/flutter-sdks', 'Flutter'],
+            ];
+
+            const override = (process.env.SIBLINGS_OVERRIDE || '').trim();
+            const siblings = (override
+              ? override.split('\n').map(line => {
+                  const [repo, ...rest] = line.trim().split(':');
+                  return [repo.trim(), rest.join(':').trim()];
+                })
+              : SDK_REPOSITORIES
+            )
+              // Matched on the repository name rather than `owner/repo`, so the check still
+              // excludes itself when it runs in a fork, where the owner differs.
+              .filter(([repo]) => repo && repo.split('/')[1] !== context.repo.repo)
+              .map(([repo, description]) => ({ repo, description }));
+
+            // `pull_request_target` carries the pull request under `pull_request`, `issue_comment`
+            // carries it under `issue`. Both expose the number, body and labels this check reads.
+            const target = context.payload.pull_request || context.payload.issue;
+            if (!target) {
+              core.setFailed('Could not find the pull request in the event payload.');
+              return;
+            }
+
+            // Editing our own comment fires `issue_comment: edited` again. Bail out before we
+            // rewrite it and loop.
+            const triggeringComment = context.payload.comment;
+            if (triggeringComment && (triggeringComment.body || '').includes(MARKER)) {
+              core.info('Triggered by this check\'s own comment; nothing to do.');
+              return;
+            }
+
+            const labels = (target.labels || []).map(label => label.name);
+            const hasRaised = labels.includes(RAISED_LABEL);
+            const hasNotNeeded = labels.includes(NOT_NEEDED_LABEL);
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: target.number,
+              per_page: 100,
+            });
+            const existing = comments.find(comment => comment.body && comment.body.includes(MARKER));
+
+            // Everywhere a port link could have been written: the pull request description and
+            // every reply on the thread, minus this check's own comment.
+            const haystack = [
+              target.body || '',
+              ...comments
+                .filter(comment => comment.id !== (existing && existing.id))
+                .map(comment => comment.body || ''),
+            ].join('\n');
+
+            // Recognises both link styles GitHub renders: the full URL and the owner/repo#123
+            // shorthand. Issues count as well as pull requests, since a recorded deferral is a
+            // recorded deferral.
+            const findPorts = (repo) => {
+              const escaped = repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const patterns = [
+                new RegExp(`https?://github\\.com/${escaped}/(?:pull|issues)/(\\d+)`, 'g'),
+                new RegExp(`(?:^|[^\\w/-])${escaped}#(\\d+)`, 'g'),
+              ];
+              const numbers = new Set();
+              for (const pattern of patterns) {
+                for (const match of haystack.matchAll(pattern)) {
+                  numbers.add(Number(match[1]));
+                }
+              }
+              return [...numbers].sort((a, b) => a - b);
+            };
+
+            const ports = siblings.map(sibling => ({ ...sibling, numbers: findPorts(sibling.repo) }));
+            const linked = ports.filter(port => port.numbers.length);
+
+            const checklist = ports
+              .map(({ repo, description, numbers }) => {
+                const box = numbers.length ? 'x' : ' ';
+                const links = numbers
+                  .map(number => `[#${number}](https://github.com/${repo}/pull/${number})`)
+                  .join(', ');
+                return `- [${box}] \`${repo}\`, ${description}${links ? ` => ${links}` : ''}`;
+              })
+              .join('\n');
+
+            const howToDecide = [
+              '| Label | What it asserts |',
+              '| --- | --- |',
+              `| \`${RAISED_LABEL}\` | The ports exist in every other SDK this change reaches, or are recorded as not applying there. |`,
+              `| \`${NOT_NEEDED_LABEL}\` | Nothing to port: a fix, refactor, docs, CI, dependency bump, release, or a change specific to this platform. |`,
+            ].join('\n');
+
+            const howToReply = [
+              '**Reply to this comment with your port links** and the boxes above tick themselves.',
+              'Nothing needs editing by hand. Either style works:',
+              '',
+              `> ${siblings[0].repo}#123`,
+              `> https://github.com/${siblings[0].repo}/pull/123`,
+            ].join('\n');
+
+            const detected = linked.length
+              ? `Detected ports in ${linked.length} of ${ports.length} sibling SDKs so far.`
+              : 'No ports detected on this thread yet.';
+
+            const unaccountedFor = [
+              'Where an SDK genuinely does not need this change, say so in a reply rather than',
+              `leaving it unaccounted for. The contract is in the [SDK development specification](${SPEC}).`,
+            ].join(' ');
+
+            let failure = null;
+            let body = null;
+
+            if (hasRaised && hasNotNeeded) {
+              failure = `This pull request carries both ${RAISED_LABEL} and ${NOT_NEEDED_LABEL}. Remove one.`;
+              body = [
+                MARKER,
+                '### 🔀 Cross-SDK feature parity',
+                '',
+                `This pull request carries **both** \`${RAISED_LABEL}\` and \`${NOT_NEEDED_LABEL}\`. Remove whichever does not apply, because the parity decision has to be unambiguous.`,
+                '',
+                howToDecide,
+              ].join('\n');
+            } else if (!hasRaised && !hasNotNeeded) {
+              failure = `This pull request must carry exactly one of ${RAISED_LABEL} or ${NOT_NEEDED_LABEL}.`;
+              body = [
+                MARKER,
+                '### 🔀 Cross-SDK feature parity',
+                '',
+                'Does this change need to ship in the other ThunderID SDKs too? This check stays red until one of these labels answers that:',
+                '',
+                howToDecide,
+                '',
+                '#### Ports',
+                '',
+                checklist,
+                '',
+                detected,
+                '',
+                howToReply,
+                '',
+                unaccountedFor,
+              ].join('\n');
+            } else if (hasRaised) {
+              body = [
+                MARKER,
+                '### 🔀 Cross-SDK feature parity, ports raised',
+                '',
+                `This pull request is labelled \`${RAISED_LABEL}\`, so the capability it introduces is expected in the other ThunderID SDKs as well.`,
+                '',
+                '#### Ports',
+                '',
+                checklist,
+                '',
+                detected,
+                '',
+                howToReply,
+                '',
+                unaccountedFor,
+              ].join('\n');
+            } else {
+              body = [
+                MARKER,
+                '### 🔀 Cross-SDK feature parity, no ports needed',
+                '',
+                `This pull request is labelled \`${NOT_NEEDED_LABEL}\`: nothing here has to ship in the other ThunderID SDKs. If that changes, swap the label for \`${RAISED_LABEL}\`.`,
+              ].join('\n');
+            }
+
+            if (existing) {
+              if (existing.body !== body) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                core.info('Comment already up to date.');
+              }
+            } else if (hasRaised || failure) {
+              // A pull request that opens straight into `prs-not-needed` has nothing to ask for,
+              // so stay quiet rather than commenting only to say there is nothing to do. Every
+              // other state, the both-labels conflict included, needs its explanation or the red
+              // check has nothing pointing at the fix.
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: target.number,
+                body,
+              });
+            }
+
+            // A comment event is not part of the pull request's check suite, so failing here would
+            // surface a red run detached from the pull request. Replies refresh the checklist
+            // only; the label gate is enforced on pull request events.
+            if (failure && context.eventName === 'issue_comment') {
+              core.info(`Checklist refreshed. The label gate is still unsatisfied: ${failure}`);
+            } else if (failure) {
+              core.setFailed(failure);
+            } else {
+              core.info(`Parity decision recorded: ${hasRaised ? RAISED_LABEL : NOT_NEEDED_LABEL}`);
+            }
