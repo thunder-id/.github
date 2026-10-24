@@ -9,7 +9,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/thunder-id/thunderid?color=blue)](https://github.com/thunder-id/thunderid/releases/latest)
 
 
-ThunderID is a lightweight, open-source IAM stack built to secure access for humans, AI agents, and machines.
+ThunderID, an [LF Decentralized Trust](https://www.lfdecentralizedtrust.org/) project, is a lightweight, open-source IAM stack built to secure access for humans, AI agents, and machines.
 
 Designed for the agentic era, ThunderID provides a developer-first IAM stack and supporting tools for securing applications, APIs, services, and agent-driven workflows. It works across traditional and decentralized identity ecosystems, with post-quantum-ready security built in from the start.
 
